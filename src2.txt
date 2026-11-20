@@ -1,0 +1,209 @@
+mkdir -p app/src/main/java/com/example/camalert
+cat > app/src/main/java/com/example/camalert/AlertService.kt <<'EOF_SRC'
+package com.example.camalert
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.location.Location
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
+import android.os.IBinder
+import android.os.Looper
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
+import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
+import com.google.android.gms.location.*
+class AlertService : Service(), TextToSpeech.OnInitListener {
+    private lateinit var tts: TextToSpeech
+    private lateinit var fused: FusedLocationProviderClient
+    private lateinit var audio: AudioManager
+    private var focusReq: AudioFocusRequest? = null
+    private var cameras: List<Camera> = emptyList()
+    private var ttsReady = false
+    private var lastId: String? = null
+    private var lastLevel = Int.MAX_VALUE
+    private val levels = intArrayOf(500, 300, 100)
+    private val attrs = AudioAttributes.Builder()
+        .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+        .build()
+    private val callback = object : LocationCallback() {
+        override fun onLocationResult(r: LocationResult) { r.lastLocation?.let(::handle) }
+    }
+    override fun onCreate() {
+        super.onCreate()
+        audio = getSystemService(AudioManager::class.java)
+        val ch = "cam_alert"
+        getSystemService(NotificationManager::class.java)
+            .createNotificationChannel(NotificationChannel(ch, "단속카메라 알림", NotificationManager.IMPORTANCE_LOW))
+        val n = NotificationCompat.Builder(this, ch)
+            .setContentTitle("단속카메라 알림 작동 중")
+            .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+            .setOngoing(true).build()
+        ServiceCompat.startForeground(this, 1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+        cameras = CameraRepository.load(this)
+        tts = TextToSpeech(this, this)
+        fused = LocationServices.getFusedLocationProviderClient(this)
+        val req = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 1000)
+            .setMinUpdateDistanceMeters(5f).build()
+        try { fused.requestLocationUpdates(req, callback, Looper.getMainLooper()) }
+        catch (e: SecurityException) { stopSelf() }
+    }
+    override fun onInit(status: Int) {
+        if (status != TextToSpeech.SUCCESS) return
+        VoiceConfig.apply(tts, this)
+        tts.setAudioAttributes(attrs)
+        tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) {}
+            override fun onDone(utteranceId: String?) { if (utteranceId == "cam") abandonFocus() }
+            @Deprecated("Deprecated in Java")
+            override fun onError(utteranceId: String?) { abandonFocus() }
+        })
+        ttsReady = true
+        speak("단속카메라 알림을 시작할게요")
+    }
+    private fun handle(loc: Location) {
+        if (!loc.hasBearing() || loc.speed < 3f) return
+        val hit = CameraMatcher.nextAhead(cameras, loc.latitude, loc.longitude, loc.bearing.toDouble())
+        if (hit == null) { lastId = null; lastLevel = Int.MAX_VALUE; return }
+        if (hit.camera.id != lastId) { lastId = hit.camera.id; lastLevel = Int.MAX_VALUE }
+        val level = levels.firstOrNull { hit.distance <= it && it < lastLevel } ?: return
+        lastLevel = level
+        val limitText = if (hit.camera.limit > 0) " 제한속도는 ${hit.camera.limit}킬로미터예요." else ""
+        val over = hit.camera.limit > 0 && loc.speed * 3.6 > hit.camera.limit
+        val warn = if (over) " 속도를 조금 줄여 주세요." else ""
+        speak("전방 ${level}미터 앞에 단속카메라가 있어요.$limitText$warn")
+    }
+    private fun speak(t: String) {
+        if (!ttsReady) return
+        requestFocus()
+        tts.playSilentUtterance(400, TextToSpeech.QUEUE_FLUSH, "pre")
+        tts.speak(t, TextToSpeech.QUEUE_ADD, null, "cam")
+    }
+    private fun requestFocus() {
+        val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+            .setAudioAttributes(attrs).build()
+        focusReq = req
+        audio.requestAudioFocus(req)
+    }
+    private fun abandonFocus() {
+        focusReq?.let { audio.abandonAudioFocusRequest(it) }
+        focusReq = null
+    }
+    override fun onDestroy() {
+        fused.removeLocationUpdates(callback)
+        tts.stop()
+        tts.shutdown()
+        abandonFocus()
+        super.onDestroy()
+    }
+    override fun onBind(i: Intent?): IBinder? = null
+}
+EOF_SRC
+mkdir -p app/src/main/java/com/example/camalert
+cat > app/src/main/java/com/example/camalert/CameraRepository.kt <<'EOF_SRC'
+package com.example.camalert
+import android.content.Context
+import java.io.File
+import java.nio.ByteBuffer
+import java.nio.charset.CharacterCodingException
+import java.nio.charset.Charset
+import java.nio.charset.Charsets
+import java.nio.charset.CodingErrorAction
+object CameraRepository {
+    private fun file(ctx: Context) = File(ctx.filesDir, "cameras.csv")
+    fun load(ctx: Context): List<Camera> {
+        val reader = if (file(ctx).exists()) file(ctx).bufferedReader()
+        else ctx.assets.open("cameras.csv").bufferedReader()
+        return reader.useLines { lines ->
+            lines.drop(1).mapNotNull { line ->
+                val p = line.split(",").map { it.trim() }
+                if (p.size < 5) return@mapNotNull null
+                val lat = p[1].toDoubleOrNull() ?: return@mapNotNull null
+                val lng = p[2].toDoubleOrNull() ?: return@mapNotNull null
+                Camera(p[0], lat, lng, p[3].toIntOrNull() ?: 0, p[4])
+            }.toList()
+        }
+    }
+    fun isImported(ctx: Context) = file(ctx).exists()
+    fun importCsv(ctx: Context, bytes: ByteArray): Int {
+        val text = decode(bytes).removePrefix("\uFEFF")
+        val rows = parseCsv(text)
+        if (rows.size < 2) return -1
+        val h = rows[0].map { it.trim() }
+        fun idx(vararg n: String): Int =
+            n.firstNotNullOfOrNull { name -> h.indexOfFirst { it.equals(name, true) }.takeIf { it >= 0 } } ?: -1
+        val iLat = idx("위도", "latitude", "lat")
+        val iLng = idx("경도", "longitude", "lng", "lon")
+        val iId = idx("무인교통단속카메라관리번호", "관리번호", "단속카메라관리번호", "id")
+        val iLim = idx("제한속도", "제한속도(km/h)", "speed_limit")
+        val iKind = idx("단속구분", "단속종류", "type")
+        if (iLat < 0 || iLng < 0) return -1
+        val sb = StringBuilder("id,lat,lng,speed_limit,type\n")
+        var n = 0
+        for ((r, row) in rows.drop(1).withIndex()) {
+            fun g(i: Int): String = if (i in row.indices) row[i].trim() else ""
+            val lat = g(iLat).toDoubleOrNull() ?: continue
+            val lng = g(iLng).toDoubleOrNull() ?: continue
+            if (lat !in 33.0..39.0 || lng !in 124.0..132.0) continue
+            if (iKind >= 0) {
+                val k = g(iKind)
+                if (k != "1" && k != "3" && !k.contains("과속")) continue
+            }
+            val lim = g(iLim).toDoubleOrNull()?.toInt() ?: 0
+            val id = g(iId).ifEmpty { "C$r" }.replace(",", " ")
+            sb.append("$id,$lat,$lng,$lim,fixed\n")
+            n++
+        }
+        if (n == 0) return -1
+        file(ctx).writeText(sb.toString())
+        return n
+    }
+    private fun decode(bytes: ByteArray): String = try {
+        Charsets.UTF_8.newDecoder()
+            .onMalformedInput(CodingErrorAction.REPORT)
+            .onUnmappableCharacter(CodingErrorAction.REPORT)
+            .decode(ByteBuffer.wrap(bytes)).toString()
+    } catch (e: CharacterCodingException) {
+        String(bytes, Charset.forName("x-windows-949"))
+    }
+    private fun parseCsv(t: String): List<List<String>> {
+        val out = ArrayList<List<String>>()
+        var row = ArrayList<String>()
+        val f = StringBuilder()
+        var q = false
+        var i = 0
+        while (i < t.length) {
+            val c = t[i]
+            if (q) {
+                if (c == '"') {
+                    if (i + 1 < t.length && t[i + 1] == '"') { f.append('"'); i++ } else { q = false }
+                } else {
+                    f.append(c)
+                }
+            } else if (c == '"') {
+                q = true
+            } else if (c == ',') {
+                row.add(f.toString()); f.clear()
+            } else if (c == '\n' || c == '\r') {
+                if (c == '\r' && i + 1 < t.length && t[i + 1] == '\n') i++
+                row.add(f.toString()); f.clear()
+                if (row.any { it.isNotBlank() }) out.add(row)
+                row = ArrayList()
+            } else {
+                f.append(c)
+            }
+            i++
+        }
+        if (f.isNotEmpty() || row.isNotEmpty()) {
+            row.add(f.toString())
+            if (row.any { it.isNotBlank() }) out.add(row)
+        }
+        return out
+    }
+}
+EOF_SRC
