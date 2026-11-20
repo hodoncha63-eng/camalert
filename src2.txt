@@ -112,7 +112,6 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.Charset
-import java.nio.charset.Charsets
 import java.nio.charset.CodingErrorAction
 object CameraRepository {
     private fun file(ctx: Context) = File(ctx.filesDir, "cameras.csv")
