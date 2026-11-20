@@ -1,0 +1,197 @@
+cat > build.gradle.kts <<'EOF_SRC'
+plugins {
+    id("com.android.application") version "8.5.2" apply false
+    id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+}
+EOF_SRC
+cat > settings.gradle.kts <<'EOF_SRC'
+pluginManagement {
+    repositories { google(); mavenCentral(); gradlePluginPortal() }
+}
+dependencyResolutionManagement {
+    repositories { google(); mavenCentral() }
+}
+rootProject.name = "camalert"
+include(":app")
+EOF_SRC
+cat > gradle.properties <<'EOF_SRC'
+android.useAndroidX=true
+org.gradle.jvmargs=-Xmx2g
+EOF_SRC
+mkdir -p app
+cat > app/build.gradle.kts <<'EOF_SRC'
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+android {
+    namespace = "com.example.camalert"
+    compileSdk = 34
+    defaultConfig {
+        applicationId = "com.example.camalert"
+        minSdk = 29
+        targetSdk = 34
+        versionCode = 2
+        versionName = "1.1"
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = "17" }
+}
+dependencies {
+    implementation("com.google.android.gms:play-services-location:21.3.0")
+    implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("androidx.core:core-ktx:1.13.1")
+}
+EOF_SRC
+mkdir -p app/src/main
+cat > app/src/main/AndroidManifest.xml <<'EOF_SRC'
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <application
+        android:label="단속카메라 알림"
+        android:theme="@style/Theme.AppCompat.DayNight">
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <service
+            android:name=".AlertService"
+            android:exported="false"
+            android:foregroundServiceType="location" />
+        <receiver android:name=".CarConnectionReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="android.bluetooth.device.action.ACL_CONNECTED" />
+                <action android:name="android.bluetooth.device.action.ACL_DISCONNECTED" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>
+EOF_SRC
+mkdir -p app/src/main/assets
+cat > app/src/main/assets/cameras.csv <<'EOF_SRC'
+id,lat,lng,speed_limit,type
+SAMPLE-1,37.5665,126.9780,50,fixed
+SAMPLE-2,37.5700,126.9820,60,fixed
+EOF_SRC
+mkdir -p app/src/main/java/com/example/camalert
+cat > app/src/main/java/com/example/camalert/Camera.kt <<'EOF_SRC'
+package com.example.camalert
+import kotlin.math.*
+data class Camera(val id: String, val lat: Double, val lng: Double, val limit: Int, val type: String)
+data class Hit(val camera: Camera, val distance: Double)
+object CameraMatcher {
+    private const val R = 6371000.0
+    fun distance(lat1: Double, lng1: Double, lat2: Double, lng2: Double): Double {
+        val p1 = Math.toRadians(lat1); val p2 = Math.toRadians(lat2)
+        val dp = p2 - p1; val dl = Math.toRadians(lng2 - lng1)
+        val a = sin(dp / 2).pow(2) + cos(p1) * cos(p2) * sin(dl / 2).pow(2)
+        return 2 * R * asin(sqrt(a))
+    }
+    fun bearing(lat1: Double, lng1: Double, lat2: Double, lng2: Double): Double {
+        val p1 = Math.toRadians(lat1); val p2 = Math.toRadians(lat2)
+        val dl = Math.toRadians(lng2 - lng1)
+        val y = sin(dl) * cos(p2)
+        val x = cos(p1) * sin(p2) - sin(p1) * cos(p2) * cos(dl)
+        return (Math.toDegrees(atan2(y, x)) + 360) % 360
+    }
+    private fun angleDiff(a: Double, b: Double): Double {
+        val d = abs(a - b) % 360
+        return if (d > 180) 360 - d else d
+    }
+    fun nextAhead(
+        cams: List<Camera>, lat: Double, lng: Double, heading: Double,
+        maxDist: Double = 600.0, maxAngle: Double = 35.0
+    ): Hit? {
+        val dLat = maxDist / 111_000.0
+        val dLng = maxDist / (111_000.0 * cos(Math.toRadians(lat)))
+        var best: Hit? = null
+        for (c in cams) {
+            if (abs(c.lat - lat) > dLat || abs(c.lng - lng) > dLng) continue
+            val d = distance(lat, lng, c.lat, c.lng)
+            if (d > maxDist) continue
+            if (angleDiff(heading, bearing(lat, lng, c.lat, c.lng)) > maxAngle) continue
+            val cur = best
+            if (cur == null || d < cur.distance) best = Hit(c, d)
+        }
+        return best
+    }
+}
+EOF_SRC
+mkdir -p app/src/main/java/com/example/camalert
+cat > app/src/main/java/com/example/camalert/CarConnectionReceiver.kt <<'EOF_SRC'
+package com.example.camalert
+import android.bluetooth.BluetoothDevice
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import androidx.core.content.ContextCompat
+class CarConnectionReceiver : BroadcastReceiver() {
+    override fun onReceive(c: Context, i: Intent) {
+        val dev: BluetoothDevice? =
+            if (Build.VERSION.SDK_INT >= 33)
+                i.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+            else @Suppress("DEPRECATION") i.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+        val saved = c.getSharedPreferences("prefs", Context.MODE_PRIVATE)
+            .getString("car_addr", null) ?: return
+        if (dev?.address != saved) return
+        val svc = Intent(c, AlertService::class.java)
+        try {
+            when (i.action) {
+                BluetoothDevice.ACTION_ACL_CONNECTED -> ContextCompat.startForegroundService(c, svc)
+                BluetoothDevice.ACTION_ACL_DISCONNECTED -> c.stopService(svc)
+            }
+        } catch (e: Exception) {
+        }
+    }
+}
+EOF_SRC
+mkdir -p app/src/main/java/com/example/camalert
+cat > app/src/main/java/com/example/camalert/VoiceConfig.kt <<'EOF_SRC'
+package com.example.camalert
+import android.content.Context
+import android.speech.tts.TextToSpeech
+import android.speech.tts.Voice
+import java.util.Locale
+object VoiceConfig {
+    const val RATE = 0.7f
+    const val PITCH = 1.05f
+    const val SAMPLE = "전방 오백 미터 앞에 단속카메라가 있어요. 제한속도는 육십 킬로미터예요."
+    fun koreanVoices(tts: TextToSpeech): List<Voice> = try {
+        val all = tts.voices?.filter { it.locale.language == "ko" } ?: emptyList()
+        val offline = all.filter { !it.isNetworkConnectionRequired }
+        (if (offline.isNotEmpty()) offline else all).sortedBy { it.name }
+    } catch (e: Exception) {
+        emptyList()
+    }
+    fun savedVoiceName(ctx: Context): String? =
+        ctx.getSharedPreferences("prefs", Context.MODE_PRIVATE).getString("voice_name", null)
+    fun saveVoiceName(ctx: Context, name: String) {
+        ctx.getSharedPreferences("prefs", Context.MODE_PRIVATE).edit().putString("voice_name", name).apply()
+    }
+    private fun defaultFemale(voices: List<Voice>): Voice? =
+        voices.firstOrNull { it.name.contains("female", true) }
+            ?: voices.firstOrNull { it.name.contains("-kob-") }
+            ?: voices.firstOrNull()
+    fun apply(tts: TextToSpeech, ctx: Context) {
+        tts.language = Locale.KOREAN
+        tts.setSpeechRate(RATE)
+        tts.setPitch(PITCH)
+        val voices = koreanVoices(tts)
+        val saved = savedVoiceName(ctx)
+        val chosen = voices.firstOrNull { it.name == saved } ?: defaultFemale(voices)
+        if (chosen != null) tts.voice = chosen
+    }
+}
+EOF_SRC
