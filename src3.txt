@@ -1,0 +1,113 @@
+mkdir -p app/src/main/java/com/example/camalert
+cat > app/src/main/java/com/example/camalert/MainActivity.kt <<'EOF_SRC'
+package com.example.camalert
+import android.Manifest
+import android.bluetooth.BluetoothManager
+import android.content.Context
+import android.os.Build
+import android.os.Bundle
+import android.speech.tts.TextToSpeech
+import android.widget.*
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+class MainActivity : AppCompatActivity() {
+    private lateinit var status: TextView
+    private var previewTts: TextToSpeech? = null
+    private val picker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) return@registerForActivityResult
+        val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+        val n = if (bytes != null) CameraRepository.importCsv(this, bytes) else -1
+        Toast.makeText(
+            this,
+            if (n > 0) "카메라 ${n}개를 불러왔습니다" else "읽지 못했습니다. 공공데이터포털의 무인교통단속카메라 CSV인지 확인하세요",
+            Toast.LENGTH_LONG
+        ).show()
+        refresh()
+    }
+    override fun onCreate(b: Bundle?) {
+        super.onCreate(b)
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 96, 48, 48)
+        }
+        status = TextView(this).apply { textSize = 16f; setPadding(0, 32, 0, 0) }
+        box.addView(Button(this).apply { text = "1. 내 차 블루투스 선택"; setOnClickListener { pickCar() } })
+        box.addView(Button(this).apply { text = "2. 카메라 데이터 파일 불러오기"; setOnClickListener { picker.launch(arrayOf("*/*")) } })
+        box.addView(Button(this).apply { text = "3. 안내 목소리 고르기 (미리듣기)"; setOnClickListener { pickVoice() } })
+        box.addView(status)
+        setContentView(box)
+        refresh()
+        askPermissions()
+    }
+    override fun onDestroy() {
+        previewTts?.stop()
+        previewTts?.shutdown()
+        super.onDestroy()
+    }
+    private fun refresh() {
+        val p = getSharedPreferences("prefs", Context.MODE_PRIVATE)
+        val data = if (CameraRepository.isImported(this)) "불러옴 (${CameraRepository.load(this).size}개)" else "없음 (예시 데이터만 있음)"
+        val voice = VoiceConfig.savedVoiceName(this) ?: "자동 (여성 목소리 우선)"
+        status.text = "선택한 차량: ${p.getString("car_name", null) ?: "없음"}\n카메라 데이터: $data\n안내 목소리: $voice"
+    }
+    private fun askPermissions() {
+        val list = mutableListOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        if (Build.VERSION.SDK_INT >= 31) list += Manifest.permission.BLUETOOTH_CONNECT
+        if (Build.VERSION.SDK_INT >= 33) list += Manifest.permission.POST_NOTIFICATIONS
+        ActivityCompat.requestPermissions(this, list.toTypedArray(), 1)
+    }
+    override fun onRequestPermissionsResult(rc: Int, p: Array<out String>, r: IntArray) {
+        super.onRequestPermissionsResult(rc, p, r)
+        if (rc == 1) ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION), 2)
+    }
+    private fun pickCar() {
+        val bt = getSystemService(BluetoothManager::class.java).adapter
+        val devs = try { bt.bondedDevices.toList() } catch (e: SecurityException) { emptyList() }
+        if (devs.isEmpty()) {
+            Toast.makeText(this, "먼저 폰에서 차량과 블루투스를 페어링하세요", Toast.LENGTH_LONG).show()
+            return
+        }
+        AlertDialog.Builder(this).setTitle("차량 선택")
+            .setItems(devs.map { it.name ?: it.address }.toTypedArray()) { _, i ->
+                getSharedPreferences("prefs", Context.MODE_PRIVATE).edit()
+                    .putString("car_addr", devs[i].address).putString("car_name", devs[i].name).apply()
+                refresh()
+            }.show()
+    }
+    private fun pickVoice() {
+        previewTts?.shutdown()
+        previewTts = TextToSpeech(this) { st ->
+            val t = previewTts
+            if (st != TextToSpeech.SUCCESS || t == null) {
+                Toast.makeText(this, "음성 엔진을 불러오지 못했습니다", Toast.LENGTH_LONG).show()
+                return@TextToSpeech
+            }
+            showVoiceDialog(t)
+        }
+    }
+    private fun showVoiceDialog(t: TextToSpeech) {
+        val voices = VoiceConfig.koreanVoices(t)
+        if (voices.isEmpty()) {
+            Toast.makeText(this, "한국어 음성이 없습니다. 폰 설정에서 한국어 음성 데이터를 설치하세요", Toast.LENGTH_LONG).show()
+            return
+        }
+        val labels = voices.mapIndexed { i, v -> "목소리 ${i + 1}  (${v.name})" }.toTypedArray()
+        val saved = VoiceConfig.savedVoiceName(this)
+        val checked = voices.indexOfFirst { it.name == saved }
+        AlertDialog.Builder(this)
+            .setTitle("목소리를 누르면 들려줍니다")
+            .setSingleChoiceItems(labels, checked) { _, i ->
+                t.voice = voices[i]
+                t.setSpeechRate(VoiceConfig.RATE)
+                t.setPitch(VoiceConfig.PITCH)
+                t.speak(VoiceConfig.SAMPLE, TextToSpeech.QUEUE_FLUSH, null, "preview")
+                VoiceConfig.saveVoiceName(this, voices[i].name)
+                refresh()
+            }
+            .setPositiveButton("확인", null)
+            .show()
+    }
+}
+EOF_SRC
