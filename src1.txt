@@ -165,7 +165,7 @@ import android.speech.tts.TextToSpeech
 import android.speech.tts.Voice
 import java.util.Locale
 object VoiceConfig {
-    const val RATE = 0.7f
+    const val RATE = 0.9f
     const val PITCH = 1.05f
     const val SAMPLE = "전방 오백 미터 앞에 단속카메라가 있어요. 제한속도는 육십 킬로미터예요."
     fun koreanVoices(tts: TextToSpeech): List<Voice> = try {
